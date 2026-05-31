@@ -5,7 +5,7 @@
  * This script opens the page and dumps all candidate selectors
  * so you can quickly find the new ones.
  *
- * Usage:  npx ts-node src/scraper/debug.ts
+ * Usage:  npm run debug
  */
 
 import { chromium } from "playwright";

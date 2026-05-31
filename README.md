@@ -31,10 +31,13 @@ cp .env.example .env
 
 ```bash
 # Run the full pipeline
+npm start
+
+# Run just the scraper
 npm run scrape
 
 # Debug selectors (opens visual browser)
-npx ts-node src/scraper/debug.ts
+npm run debug
 ```
 
 ## Phases
@@ -51,7 +54,7 @@ npx ts-node src/scraper/debug.ts
 
 **Selectors not working?** LinkedIn periodically changes CSS classes.
 ```bash
-npx ts-node src/scraper/debug.ts
+npm run debug
 ```
 This opens a visual browser and prints all candidate selectors.
 

@@ -33,11 +33,14 @@ export const SCRAPER_CONFIG = {
 
   scraping: {
     // How many job cards to extract per run (LinkedIn paginates at 25)
-    maxJobs: 25,
+    // maxJobs: 25, 
     // Milliseconds to wait after page load before scraping
     // LinkedIn is JS-heavy — we need to wait for cards to render
     pageLoadWait: 3000,
     // Timeout for individual element queries (ms)
     elementTimeout: 10000,
+    // Pagination
+    maxPages: 3,           // 3 pages × 25 = up to 75 jobs
+    pageDelay: () => Math.floor(Math.random() * 1500) + 1500, // 1.5–3s random delay
   },
 } as const;

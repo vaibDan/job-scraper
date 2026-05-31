@@ -4,9 +4,11 @@
   "description": "A deterministic, modular job search pipeline for DevOps/Cloud/SRE roles.",
   "main": "index.js",
   "scripts": {
-    "start": "node --loader ts-node/esm src/main.ts",
-    "debug": "node --loader ts-node/esm src/scraper/debug.ts",
-    "scrape": "node --loader ts-node/esm src/scraper/index.ts"
+    "build": "tsc --outDir dist",
+    "typecheck": "tsc --noEmit",
+    "start": "npm run build && node dist/src/main.js",
+    "debug": "npm run build && node dist/src/scraper/debug.js",
+    "scrape": "npm run build && node dist/src/scraper/index.js"
   },
   "keywords": [],
   "author": "",

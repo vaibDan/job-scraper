@@ -1,19 +1,12 @@
 /**
- * LinkedIn Job Scraper — Phase 1 Core
+ * LinkedIn Job Scraper
  *
- * Architecture decisions:
- * 1. headless: true in prod, false for debugging (flip in config)
- * 2. We scrape the PUBLIC LinkedIn jobs page — no login required for listings
- * 3. Each job card is scraped independently — one card failing doesn't crash the run
- * 4. We use page.evaluate() to run code inside the browser's JS context
- *    This is faster than Playwright's built-in locators for bulk extraction
+ * Strategy:
+ * 1. Load the search page
+ * 2. Scroll `maxPages` times to trigger lazy loading
+ * 3. Extract ALL cards from final DOM state in one pass
  *
- * LinkedIn's DOM structure (as of 2025):
- *   ul.jobs-search__results-list > li > div.base-card
- *     .base-search-card__title     → job title
- *     .base-search-card__subtitle  → company name
- *     .job-search-card__location   → location
- *     a.base-card__full-link       → job URL
+ * No XHR intercept, no artificial job cap, no complexity.
  */
 
 import { chromium } from "playwright";
@@ -21,158 +14,135 @@ import { SCRAPER_CONFIG } from "../../config/scraper.config.js";
 import { buildLinkedInSearchUrl } from "./buildUrl.js";
 import type { RawJob, ScrapeResult } from "./types.js";
 
-/**
- * Main scraper function.
- * Returns a ScrapeResult with raw (uncleaned) job data.
- * The parser layer handles cleaning — single responsibility.
- */
+function dedup(jobs: RawJob[]): RawJob[] {
+  const seen = new Set<string>();
+  return jobs.filter((job) => {
+    if (!job.url) return false;
+    const key = job.url.split("?")[0];
+    if (seen.has(key as string)) return false;
+    seen.add(key as string);
+    return true;
+  });
+}
+
 export async function scrapeLinkedInJobs(): Promise<ScrapeResult> {
   const searchUrl = buildLinkedInSearchUrl();
   const runAt = new Date().toISOString();
   const scrapedAt = runAt;
+  const { maxPages, pageDelay, pageLoadWait } = SCRAPER_CONFIG.scraping;
 
-  console.log("\n🚀 PJSS Scraper — Phase 1");
+  console.log("\n🚀 PJSS Scraper — LinkedIn");
   console.log("━".repeat(50));
-  console.log(`🔍 Search URL: ${searchUrl}`);
-  console.log(`📅 Run started: ${runAt}\n`);
+  console.log(`🔍 URL     : ${searchUrl}`);
+  console.log(`📄 Scrolls : ${maxPages}`);
+  console.log(`📅 Started : ${runAt}\n`);
 
-  // Launch browser
-  // headless: true = no visible window (for automation)
-  // executablePath: use pre-installed Chromium, avoids download
   const browser = await chromium.launch({
     headless: SCRAPER_CONFIG.browser.headless,
     slowMo: SCRAPER_CONFIG.browser.slowMo,
   });
 
-  console.log("✅ Browser launched");
-
-  // Create a new browser context — like an incognito window
-  // Contexts are isolated: cookies, cache, localStorage don't bleed between runs
   const context = await browser.newContext({
-    // Pretend to be a real browser — LinkedIn checks user agents
     userAgent:
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-    // Set viewport — LinkedIn renders differently on mobile
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     viewport: { width: 1280, height: 800 },
   });
 
   const page = await context.newPage();
 
-  // Block unnecessary resources to speed up scraping
-  // Images, fonts, and media don't help us — skip them
-  await page.route("**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,mp4,webm}", (route) =>
-    route.abort()
+  // Block images, fonts, tracking — speeds up page load significantly
+  await page.route(
+    "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,mp4,webm}",
+    (route) => route.abort()
   );
-  // Block LinkedIn analytics and tracking scripts
   await page.route("**/li/track**", (route) => route.abort());
 
-  console.log("✅ Page configured (resource blocking enabled)");
-
-  let jobs: RawJob[] = [];
-  let totalFound = 0;
+  let allJobs: RawJob[] = [];
 
   try {
-    // Navigate to the search URL
-    console.log("🌐 Navigating to LinkedIn Jobs...");
+    // ── Step 1: Initial load ──────────────────────────────────────────────
+    console.log("🌐 Loading page...");
     await page.goto(searchUrl, {
-      // 'domcontentloaded' fires earlier than 'load' — LinkedIn's JS loads async
-      // We'll wait manually after this for the cards to appear
       waitUntil: "domcontentloaded",
       timeout: 30000,
     });
 
-    // Wait for job cards to render
-    // LinkedIn is a React SPA — DOM updates after initial load
-    console.log(`⏳ Waiting ${SCRAPER_CONFIG.scraping.pageLoadWait}ms for cards to render...`);
-    await page.waitForTimeout(SCRAPER_CONFIG.scraping.pageLoadWait);
+    // Wait for first batch of cards to render
+    await page.waitForSelector(".base-card", {
+      timeout: SCRAPER_CONFIG.scraping.elementTimeout,
+    }).catch(() => console.warn("⚠️  No cards found on initial load"));
 
-    // Check if job cards are present
-    // LinkedIn uses .base-card for each job listing
-    const cardSelector = ".base-card";
-    try {
-      await page.waitForSelector(cardSelector, {
-        timeout: SCRAPER_CONFIG.scraping.elementTimeout,
-      });
-      console.log("✅ Job cards detected in DOM");
-    } catch {
-      console.warn("⚠️  No job cards found — LinkedIn may have changed its DOM structure");
-      console.warn("    Try: headless: false in config to debug visually");
+    await page.waitForTimeout(pageLoadWait);
+
+    const initialCount = await page.locator(".base-card").count();
+    console.log(`✅ Initial load: ${initialCount} cards in DOM`);
+
+    // ── Step 2: Scroll to load more cards ────────────────────────────────
+    for (let i = 1; i <= maxPages; i++) {
+      const delay = pageDelay();
+      console.log(`⏳ Scroll ${i}/${maxPages} — waiting ${delay}ms...`);
+      await page.waitForTimeout(delay);
+
+      const beforeCount = await page.locator(".base-card").count();
+
+      // Scroll to bottom — triggers LinkedIn's lazy loader
+      await page.evaluate(() =>
+        window.scrollTo(0, document.body.scrollHeight)
+      );
+
+      // Wait for new cards to appear (up to 4s)
+      await page.waitForFunction(
+        (before: number) => document.querySelectorAll(".base-card").length > before,
+        beforeCount,
+        { timeout: 4000 }
+      ).catch(() => null); // no new cards = end of results, not an error
+
+      const afterCount = await page.locator(".base-card").count();
+
+      if (afterCount > beforeCount) {
+        console.log(`   ↳ ${afterCount - beforeCount} new cards loaded (total: ${afterCount})`);
+      } else {
+        console.log(`   ↳ No new cards — LinkedIn has no more results`);
+        break;
+      }
     }
 
-    // Count total cards available on the page
-    totalFound = await page.locator(cardSelector).count();
-    console.log(`📊 Total job cards on page: ${totalFound}`);
+    // ── Step 3: Extract all cards from final DOM state ────────────────────
+    // Single pass after all scrolling is done
+    const rawJobs = await page.evaluate((scrapedAt: string) => {
+      return Array.from(document.querySelectorAll(".base-card")).map((card) => {
+        const getText = (sel: string) =>
+          card.querySelector(sel)?.textContent?.trim() ?? null;
 
-    // Extract data from all cards using page.evaluate()
-    // page.evaluate() runs inside the browser's JS context — fast bulk extraction
-    // We pass maxJobs as an argument (can't access Node.js vars directly in evaluate)
-    const maxJobs = SCRAPER_CONFIG.scraping.maxJobs;
+        const linkEl = card.querySelector("a.base-card__full-link");
 
-    console.log(`🔎 Extracting up to ${maxJobs} jobs...\n`);
+        return {
+          title: getText(".base-search-card__title"),
+          company: getText(".base-search-card__subtitle"),
+          location: getText(".job-search-card__location"),
+          url: linkEl ? (linkEl as HTMLAnchorElement).href : null,
+          description: null as null,
+          scrapedAt,
+        };
+      });
+    }, scrapedAt);
 
-    jobs = await page.evaluate(
-      ({ maxJobs, scrapedAt }) => {
-        // This code runs INSIDE the browser — DOM APIs are available here
-        const cards = Array.from(document.querySelectorAll(".base-card")).slice(0, maxJobs);
+    allJobs = dedup(rawJobs);
 
-        return cards.map((card): {
-          title: string | null;
-          company: string | null;
-          location: string | null;
-          url: string | null;
-          description: string | null;
-          scrapedAt: string;
-        } => {
-          // Helper: safely query an element and return its text
-          const getText = (selector: string): string | null => {
-            const el = card.querySelector(selector);
-            return el ? el.textContent?.trim() ?? null : null;
-          };
+    console.log(`\n✅ Extraction complete: ${allJobs.length} jobs (deduped)`);
 
-          // Job URL lives on the anchor tag wrapping the entire card
-          const linkEl = card.querySelector("a.base-card__full-link");
-          const rawUrl = linkEl ? (linkEl as HTMLAnchorElement).href : null;
-
-          // LinkedIn URLs have tracking params — we'll clean those in the parser
-          return {
-            title: getText(".base-search-card__title"),
-            company: getText(".base-search-card__subtitle"),
-            location: getText(".job-search-card__location"),
-            url: rawUrl,
-            // Description is not available on the card — requires clicking into the job
-            // We'll add this in Phase 2 (detail page scraping) if needed
-            description: null,
-            scrapedAt,
-          };
-        });
-      },
-      { maxJobs, scrapedAt }
-    );
-
-    // Log what we found
-    console.log("━".repeat(50));
-    console.log(`✅ Extraction complete — ${jobs.length} jobs extracted\n`);
-
-    jobs.forEach((job, i) => {
-      console.log(`[${String(i + 1).padStart(2, "0")}] ${job.title ?? "Unknown Title"}`);
-      console.log(`     📍 ${job.company ?? "Unknown"} · ${job.location ?? "Unknown"}`);
-      console.log(`     🔗 ${job.url ? job.url.substring(0, 70) + "..." : "No URL"}`);
-      console.log();
-    });
   } catch (error) {
     console.error("❌ Scraping failed:", error);
     throw error;
   } finally {
-    // Always close the browser — even if scraping threw an error
-    // Not closing = zombie browser processes that eat RAM
     await browser.close();
-    console.log("✅ Browser closed");
+    console.log("✅ Browser closed\n");
   }
 
   return {
-    jobs,
-    totalFound,
-    scrapedCount: jobs.length,
+    jobs: allJobs,
+    totalFound: allJobs.length,
+    scrapedCount: allJobs.length,
     runAt,
     searchUrl,
   };
