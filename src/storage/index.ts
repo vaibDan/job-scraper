@@ -127,9 +127,9 @@ export function saveJobs(jobs: NormalizedJob[]): StorageResult {
         added++;
     }
 
-    // Count total rows (subtract 1 for header)
-    const totalLines = readFileSync(CSV_PATH, "utf-8").trim().split("\n").length;
-    const totalInFile = totalLines - 1;
+    // Count total rows — read fresh after writes, subtract header
+    const finalContent = readFileSync(CSV_PATH, "utf-8").trim();
+    const totalInFile = finalContent.split("\n").length - 1;;
 
     return { added, duplicates, totalInFile };
 }
