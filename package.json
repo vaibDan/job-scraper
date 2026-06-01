@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit",
     "start": "npm run build && node dist/src/main.js",
     "debug": "npm run build && node dist/src/scraper/debug.js",
+    "debugNaukri": "npm run build && node dist/src/scraper/naukri/debug.js",
     "scrape": "npm run build && node dist/src/scraper/index.js"
   },
   "keywords": [],

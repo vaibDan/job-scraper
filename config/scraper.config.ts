@@ -26,7 +26,9 @@ export const SCRAPER_CONFIG = {
 
   browser: {
     headless: true,
-    // Use pre-installed Chromium (avoids download requirement)
+    naukriHeadless: false,
+    // Path to a locally installed Chromium executable, if needed.
+    executablePath: process.env.CHROMIUM_EXECUTABLE_PATH ?? undefined,
     // Slow down actions by N ms — useful for debugging (set to 0 in prod)
     slowMo: 0,
   },

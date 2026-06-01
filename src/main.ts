@@ -1,61 +1,77 @@
+/**
+ * PJSS Orchestrator
+ *
+ * Pipeline:
+ *   LinkedIn scraper  ─┐
+ *                      ├─→ merge → parse → filter → storage
+ *   Naukri scraper   ─┘
+ */
+
 import { scrapeLinkedInJobs } from "./scraper/index.js";
+import { scrapeNaukriJobs } from "./scraper/naukri/index.js";
 import { parseJobs } from "./parser/index.js";
 import { filterJobs } from "./filters/index.js";
 import { saveJobs } from "./storage/index.js";
 
+// Control which scrapers run — flip to false to skip one
+const RUN_LINKEDIN = false;
+const RUN_NAUKRI = true;
+
 async function main(): Promise<void> {
   try {
-    // ── Phase 1: Scrape ──────────────────────────────────────────────
-    const scrapeResult = await scrapeLinkedInJobs();
+    const allRaw = [];
 
-    // ── Phase 2a: Parse ──────────────────────────────────────────────
-    const { normalized, skipped } = parseJobs(scrapeResult.jobs);
+    // ── Scrape ───────────────────────────────────────────────────────────
+    if (RUN_LINKEDIN) {
+      const result = await scrapeLinkedInJobs();
+      allRaw.push(...result.jobs);
+      console.log(`📌 LinkedIn: ${result.scrapedCount} raw jobs\n`);
+    }
 
-    console.log(`\n📦 Parser`);
-    console.log(`   Input  : ${scrapeResult.jobs.length} raw jobs`);
-    console.log(`   Output : ${normalized.length} normalized (${skipped} skipped — missing fields)`);
+    if (RUN_NAUKRI) {
+      const result = await scrapeNaukriJobs();
+      allRaw.push(...result.jobs);
+      console.log(`📌 Naukri: ${result.scrapedCount} raw jobs\n`);
+    }
 
-    // ── Phase 2b: Filter ─────────────────────────────────────────────
+    console.log(`📦 Total raw: ${allRaw.length} jobs from all sources\n`);
+
+    // ── Parse ────────────────────────────────────────────────────────────
+    const { normalized, skipped } = parseJobs(allRaw);
+    console.log(`📦 Parser`);
+    console.log(`   Input  : ${allRaw.length}`);
+    console.log(`   Output : ${normalized.length} (${skipped} skipped)\n`);
+
+    // ── Filter ───────────────────────────────────────────────────────────
     const { passed, rejected } = filterJobs(normalized);
-
-    console.log(`\n🔽 Filter`);
-    console.log(`   Passed : ${passed.length}`);
+    console.log(`🔽 Filter`);
+    console.log(`   Passed  : ${passed.length}`);
     console.log(`   Rejected: ${rejected.length}`);
 
     if (rejected.length > 0) {
-      console.log("\n   Rejected jobs:");
+      console.log("\n   Rejected:");
       rejected.forEach(({ job, reason }) => {
         console.log(`   ✗ ${job.title} @ ${job.company}`);
         console.log(`     → ${reason}`);
       });
     }
 
-    // console.log("\n✅ Jobs that passed all filters:");
-    // console.log("─".repeat(60));
-    // passed.forEach((job, i) => {
-    //   console.log(`[${String(i + 1).padStart(2, "0")}] ${job.title}`);
-    //   console.log(`     🏢 ${job.company}`);
-    //   console.log(`     📍 ${job.location}`);
-    //   console.log(`     🔗 ${job.url}`);
-    //   console.log(`     🆔 ${job.id}`);
-    //   console.log();
-    // });
-
-    // ── Phase 3: Storage ─────────────────────────────────────────────
+    // ── Storage ──────────────────────────────────────────────────────────
     const storageResult = saveJobs(passed);
     console.log(`\n💾 Storage`);
-    console.log(`   Added      : ${storageResult.added} new jobs`);
-    console.log(`   Duplicates : ${storageResult.duplicates} already in CSV`);
+    console.log(`   Added       : ${storageResult.added} new jobs`);
+    console.log(`   Duplicates  : ${storageResult.duplicates} already in CSV`);
     console.log(`   Total in CSV: ${storageResult.totalInFile}`);
 
-    // ── Summary ──────────────────────────────────────────────────────
+    // ── Summary ──────────────────────────────────────────────────────────
+    const withJd = passed.filter((j) => j.description && j.description.length > 0).length;
+    console.log("\n" + "━".repeat(50));
+    console.log(`📋 Run Summary`);
+    console.log(`   New jobs saved : ${storageResult.added}`);
+    console.log(`   With full JD   : ${withJd}`);
+    console.log(`   Total tracked  : ${storageResult.totalInFile}`);
     console.log("━".repeat(50));
-    console.log("📋 Run Summary");
-    console.log(`   Scraped  : ${scrapeResult.scrapedCount}`);
-    console.log(`   Parsed   : ${normalized.length}`);
-    console.log(`   Filtered : ${passed.length} jobs ready`);
-    console.log("━".repeat(50));
-    console.log("\n✅ Phase 3 complete. Next: Phase 4 (AI ranking)\n");
+    console.log("\n✅ Done. Open data/job_tracker.csv to review.\n");
 
   } catch (error) {
     console.error("\n❌ PJSS run failed:", error);

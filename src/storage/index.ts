@@ -34,6 +34,7 @@ const CSV_HEADERS: (keyof StoredJob)[] = [
     "company",
     "location",
     "url",
+    "description",
     "status",
     "priority",
     "notes",
