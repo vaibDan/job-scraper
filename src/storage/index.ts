@@ -42,6 +42,8 @@ const CSV_HEADERS: (keyof StoredJob)[] = [
     "scrapedAt",
 ];
 
+const CSV_HEADER_LINE = CSV_HEADERS.join(",");
+
 // ─── CSV helpers ──────────────────────────────────────────────────────────────
 
 function escapeCell(value: string | number): string {
@@ -57,6 +59,27 @@ function rowToLine(job: StoredJob): string {
     return CSV_HEADERS.map((key) => escapeCell(job[key])).join(",");
 }
 
+function hasExpectedHeader(line: string | undefined): boolean {
+    if (!line) return false;
+    const cols = line.split(",");
+    return CSV_HEADERS.every((header, index) => cols[index]?.trim() === header);
+}
+
+function ensureCsvHeader(): void {
+    if (!existsSync(CSV_PATH)) return;
+
+    const content = readFileSync(CSV_PATH, "utf-8");
+    const lines = content.split("\n");
+    if (hasExpectedHeader(lines[0])) return;
+
+    const normalizedLines =
+        content.trim().length === 0
+            ? [CSV_HEADER_LINE]
+            : [CSV_HEADER_LINE, ...lines];
+    writeFileSync(CSV_PATH, normalizedLines.join("\n"), "utf-8");
+    console.log(`🛠️ Added missing CSV header to ${CSV_PATH}`);
+}
+
 // ─── Load existing IDs ────────────────────────────────────────────────────────
 
 /**
@@ -67,12 +90,13 @@ function loadExistingIds(): Set<string> {
     if (!existsSync(CSV_PATH)) return new Set();
 
     const content = readFileSync(CSV_PATH, "utf-8");
-    const lines = content.trim().split("\n");
+    const lines = content.split("\n");
+    const dataStartIndex = hasExpectedHeader(lines[0]) ? 1 : 0;
 
-    // Skip header row, extract first column (id)
+    // Skip header row (if present), extract first column (id)
     return new Set(
         lines
-            .slice(1)
+            .slice(dataStartIndex)
             .filter((line) => line.trim().length > 0)
             .map((line) => {
                 // Parse first CSV field correctly (handles quoted fields with escaped quotes)
@@ -96,14 +120,16 @@ export interface StorageResult {
 }
 
 export function saveJobs(jobs: NormalizedJob[]): StorageResult {
-    const existingIds = loadExistingIds();
     const isNewFile = !existsSync(CSV_PATH);
 
     // Write header if file doesn't exist yet
     if (isNewFile) {
-        writeFileSync(CSV_PATH, CSV_HEADERS.join(",") + "\n", "utf-8");
+        writeFileSync(CSV_PATH, CSV_HEADER_LINE + "\n", "utf-8");
         console.log(`📄 Created new file: ${CSV_PATH}`);
+    } else {
+        ensureCsvHeader();
     }
+    const existingIds = loadExistingIds();
 
     let added = 0;
     let duplicates = 0;
@@ -128,9 +154,11 @@ export function saveJobs(jobs: NormalizedJob[]): StorageResult {
         added++;
     }
 
-    // Count total rows — read fresh after writes, subtract header
-    const finalContent = readFileSync(CSV_PATH, "utf-8").trim();
-    const totalInFile = finalContent.split("\n").length - 1;;
+    // Count total data rows — read fresh after writes and ignore header if present
+    const finalContent = readFileSync(CSV_PATH, "utf-8");
+    const finalLines = finalContent.split("\n").filter((line) => line.trim().length > 0);
+    const hasHeader = hasExpectedHeader(finalLines[0]);
+    const totalInFile = hasHeader ? Math.max(0, finalLines.length - 1) : finalLines.length;
 
     return { added, duplicates, totalInFile };
 }
