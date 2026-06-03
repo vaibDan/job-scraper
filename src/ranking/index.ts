@@ -2,7 +2,7 @@
  * AI Ranking Engine — Phase 4
  *
  * Scores each job 0–100 based on fit with Vaibhav's profile.
- * Uses Gemini via Google Generative Language API.
+ * Uses Gemini or local Ollama for AI scoring.
  *
  * Design decisions:
  * 1. Batch jobs into groups of 5 — one API call per batch, not per job
@@ -59,6 +59,15 @@ function readPositiveIntEnv(name: string, fallback: number): number {
 
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type AIProvider = "gemini" | "ollama";
+
+function getAIProvider(): AIProvider {
+    const provider = process.env.AI_PROVIDER?.trim().toLowerCase() || "gemini";
+    if (provider === "gemini" || provider === "ollama") return provider;
+
+    throw new Error(`Unsupported AI_PROVIDER "${provider}". Use "gemini" or "ollama".`);
 }
 
 const JOB_TRACKER_HEADERS = [
@@ -196,19 +205,78 @@ async function callGemini(prompt: string): Promise<string> {
     });
 }
 
-async function callGeminiWithRetry(prompt: string): Promise<string> {
-    const attempts = readPositiveIntEnv("GEMINI_RETRY_ATTEMPTS", 2);
+async function callOllama(prompt: string): Promise<string> {
+    const model = process.env.OLLAMA_MODEL?.trim() || "llama3.1:8b";
+    const baseUrl = process.env.OLLAMA_BASE_URL?.trim() || "http://localhost:11434";
+    const maxOutputTokens = readPositiveIntEnv("OLLAMA_NUM_PREDICT", 2000);
+    const timeoutMs = readPositiveIntEnv("OLLAMA_TIMEOUT_MS", 120000);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+        const response = await fetch(`${baseUrl.replace(/\/$/, "")}/api/generate`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                model,
+                prompt,
+                stream: false,
+                format: "json",
+                options: {
+                    temperature: 0.2,
+                    num_predict: maxOutputTokens,
+                },
+            }),
+            signal: controller.signal,
+        });
+
+        const data = await response.text();
+        if (!response.ok) {
+            throw new Error(`Ollama API error ${response.status}: ${data}`);
+        }
+
+        try {
+            const parsed = JSON.parse(data);
+            const text = parsed.response ?? "";
+            if (!text.trim()) {
+                throw new Error(`Ollama API returned no text: ${data.slice(0, 200)}`);
+            }
+            return text;
+        } catch {
+            throw new Error(`Failed to parse Ollama response: ${data.slice(0, 200)}`);
+        }
+    } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+            throw new Error(`Ollama API timeout after ${timeoutMs}ms`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+async function callLLM(prompt: string): Promise<string> {
+    const provider = getAIProvider();
+    return provider === "ollama" ? callOllama(prompt) : callGemini(prompt);
+}
+
+async function callLLMWithRetry(prompt: string): Promise<string> {
+    const provider = getAIProvider();
+    const attempts = readPositiveIntEnv(`${provider.toUpperCase()}_RETRY_ATTEMPTS`, 2);
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
         try {
-            return await callGemini(prompt);
+            return await callLLM(prompt);
         } catch (error) {
             lastError = error;
             if (attempt === attempts) break;
 
-            const delayMs = readPositiveIntEnv("GEMINI_RETRY_DELAY_MS", 10000) * attempt;
-            console.warn(`     Gemini call failed (${String(error)}). Retrying in ${Math.round(delayMs / 1000)}s...`);
+            const delayMs = readPositiveIntEnv(`${provider.toUpperCase()}_RETRY_DELAY_MS`, 10000) * attempt;
+            console.warn(`     ${provider} call failed (${String(error)}). Retrying in ${Math.round(delayMs / 1000)}s...`);
             await sleep(delayMs);
         }
     }
@@ -285,23 +353,108 @@ Format:
 
 // ─── Parse LLM response ───────────────────────────────────────────────────────
 
-function parseLLMResponse(raw: string, jobs: JobToRank[]): LLMScoreResult[] {
-    // Strip markdown code fences if present
+function extractJsonCandidate(raw: string): string {
     const cleaned = raw
         .replace(/```json\n?/g, "")
         .replace(/```\n?/g, "")
         .trim();
 
+    if (cleaned.startsWith("[") || cleaned.startsWith("{")) {
+        return cleaned;
+    }
+
+    const arrayStart = cleaned.indexOf("[");
+    const arrayEnd = cleaned.lastIndexOf("]");
+    if (arrayStart !== -1 && arrayEnd > arrayStart) {
+        return cleaned.slice(arrayStart, arrayEnd + 1);
+    }
+
+    const objectStart = cleaned.indexOf("{");
+    const objectEnd = cleaned.lastIndexOf("}");
+    if (objectStart !== -1 && objectEnd > objectStart) {
+        return cleaned.slice(objectStart, objectEnd + 1);
+    }
+
+    return cleaned;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null;
+}
+
+function normalizeAction(action: unknown, score: number): LLMScoreResult["action"] {
+    if (action === "apply" || action === "consider" || action === "skip") {
+        return action;
+    }
+
+    if (score >= 70) return "apply";
+    if (score >= 40) return "consider";
+    return "skip";
+}
+
+function normalizeStringList(value: unknown): string[] {
+    if (Array.isArray(value)) {
+        return value.map((item) => String(item)).filter((item) => item.trim().length > 0);
+    }
+
+    if (typeof value === "string" && value.trim().length > 0) {
+        return [value.trim()];
+    }
+
+    return [];
+}
+
+function normalizeLLMScoreResults(parsed: unknown, jobs: JobToRank[]): LLMScoreResult[] {
+    const source = Array.isArray(parsed)
+        ? parsed
+        : isRecord(parsed) && Array.isArray(parsed.results)
+            ? parsed.results
+            : isRecord(parsed) && Array.isArray(parsed.jobs)
+                ? parsed.jobs
+                : isRecord(parsed) && Array.isArray(parsed.scores)
+                    ? parsed.scores
+                    : isRecord(parsed)
+                        ? [parsed]
+                        : [];
+
+    if (source.length === 0) {
+        throw new Error("Response did not contain score objects");
+    }
+
+    return source
+        .filter(isRecord)
+        .map((item, index) => {
+            const rawScore = Number(item.score);
+            const score = Number.isFinite(rawScore)
+                ? Math.max(0, Math.min(100, Math.round(rawScore)))
+                : 50;
+
+            return {
+                id: typeof item.id === "string" && item.id.trim().length > 0
+                    ? item.id.trim()
+                    : jobs[index]?.id ?? "",
+                score,
+                reasons: normalizeStringList(item.reasons),
+                redFlags: normalizeStringList(item.redFlags ?? item.red_flags),
+                action: normalizeAction(item.action, score),
+            };
+        })
+        .filter((result) => result.id.length > 0);
+}
+
+function parseLLMResponse(raw: string, jobs: JobToRank[]): LLMScoreResult[] {
     try {
-        const parsed = JSON.parse(cleaned);
-        if (!Array.isArray(parsed)) throw new Error("Response is not an array");
-        return parsed;
-    } catch {
+        const parsed = JSON.parse(extractJsonCandidate(raw));
+        const results = normalizeLLMScoreResults(parsed, jobs);
+        if (results.length === 0) throw new Error("Response had no usable scores");
+        return results;
+    } catch (error) {
         console.warn("⚠️  LLM response parse failed — assigning default scores");
+        console.warn("Parse error:", String(error));
         console.warn("Raw response:", raw.slice(0, 300));
         // Fallback: assign 50 to all jobs in batch
-        return jobs.map((j) => ({
-            id: j.id,
+        return jobs.map((job) => ({
+            id: job.id,
             score: 50,
             reasons: ["Parse error — manual review needed"],
             redFlags: [],
@@ -441,8 +594,10 @@ const MAX_JOBS_PER_RUN = readPositiveIntEnv("RANKING_MAX_JOBS_PER_RUN", 25);
 
 export async function rankJobs(jobs: JobToRank[]): Promise<RankedJob[]> {
     const jobsToRank = jobs.slice(0, MAX_JOBS_PER_RUN);
+    const provider = getAIProvider();
 
     console.log(`\n🤖 AI Ranking Engine`);
+    console.log(`   Provider     : ${provider}`);
     console.log(`   Jobs to rank : ${jobsToRank.length}${jobs.length > jobsToRank.length ? ` of ${jobs.length}` : ""}`);
     console.log(`   Batch size   : ${BATCH_SIZE}`);
     console.log(`   Batch delay  : ${BATCH_DELAY}ms`);
@@ -464,7 +619,7 @@ export async function rankJobs(jobs: JobToRank[]): Promise<RankedJob[]> {
         console.log(`  📦 Batch ${batchNum}/${totalBatches}: scoring ${batch.length} jobs...`);
 
         const prompt = buildScoringPrompt(batch);
-        const raw = await callGeminiWithRetry(prompt);
+        const raw = await callLLMWithRetry(prompt);
         const results = parseLLMResponse(raw, batch);
 
         // Merge scores back into job objects

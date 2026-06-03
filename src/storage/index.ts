@@ -9,8 +9,8 @@
  * 4. Status field — tracks application state across runs
  */
 
-import { existsSync, readFileSync, writeFileSync, appendFileSync } from "fs";
-import { join } from "path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "fs";
+import { dirname, join } from "path";
 import type { NormalizedJob } from "../scraper/types.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -120,6 +120,8 @@ export interface StorageResult {
 }
 
 export function saveJobs(jobs: NormalizedJob[]): StorageResult {
+    mkdirSync(dirname(CSV_PATH), { recursive: true });
+
     const isNewFile = !existsSync(CSV_PATH);
 
     // Write header if file doesn't exist yet
